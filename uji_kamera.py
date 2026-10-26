@@ -163,8 +163,8 @@ def proses_ai():
 
         # Jeda tambahan agar inferensi tidak terus membebani CPU
         waktu_proses = time.time() - waktu_mulai
-        if waktu_proses < 0.20:
-            time.sleep(0.20 - waktu_proses)
+        if waktu_proses < 0.10:
+            time.sleep(0.10 - waktu_proses)
 
 
 # Jalankan pengambilan kamera dan AI secara terpisah
@@ -196,14 +196,25 @@ try:
             time.sleep(0.005)
             continue
 
+        
+        # Mirror frame kamera terlebih dahulu
+        frame_tampil = cv2.flip(frame_tampil, 1)
+
+        tinggi, lebar = frame_tampil.shape[:2]
+
         for hasil in hasil_tampil:
             x1, y1, x2, y2 = hasil["bbox"]
+
+            # Balik koordinat kotak secara horizontal
+            x1_baru = lebar - x2
+            x2_baru = lebar - x1
+
             warna = hasil["warna"]
 
             cv2.rectangle(
                 frame_tampil,
-                (x1, y1),
-                (x2, y2),
+                (x1_baru, y1),
+                (x2_baru, y2),
                 warna,
                 2
             )
@@ -213,7 +224,7 @@ try:
             cv2.putText(
                 frame_tampil,
                 teks,
-                (x1, max(25, y1 - 10)),
+                (x1_baru, max(25, y1 - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 warna,
@@ -224,6 +235,7 @@ try:
             "Uji Face Recognition - Tekan Q untuk keluar",
             frame_tampil
         )
+
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
