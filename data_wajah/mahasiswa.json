@@ -1,11 +1,17 @@
-
 {
+    "A320250034": {
+        "nama": "Januar Arif Wicaksono",
+        "folder_foto": "A320250034",
+        "prodi": "S1 Rekayasa Perangkat Lunak"
+    },
     "A320250010": {
         "nama": "Gavra Darius Ulul Albab",
-        "folder_foto": "A320250010"
+        "folder_foto": "A320250010",
+        "prodi": "S1 Rekayasa Perangkat Lunak"
     },
     "A320250001": {
         "nama": "Zaky Choirul Alfan",
-        "folder_foto": "A320250001"
+        "folder_foto": "A320250001",
+        "prodi": "S1 Rekayasa Perangkat Lunak"
     }
 }

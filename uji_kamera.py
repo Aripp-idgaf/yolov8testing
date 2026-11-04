@@ -1,91 +1,93 @@
 import threading
 import time
 import cv2
-import json
-import os
 import numpy as np
+import psycopg2
 from insightface.app import FaceAnalysis
 
-# Threshold sementara untuk pengujian, belum final
-THRESHOLD_UJI = 0.50
+# Threshold
+# REVISI: Menaikkan threshold agar lebih ketat (menghindari False Positive)
+THRESHOLD_UJI = 0.65
 MINIMAL_SELISIH = 0.10
 
-# Muat model pengenalan wajah
+# 1. TARIK DATA DARI DATABASE POSTGRESQL (DENGAN RELASI PRODI)
+print("1. Menghubungkan ke PostgreSQL...")
+try:
+    koneksi = psycopg2.connect(
+        host="localhost",
+        database="postgres",
+        user="postgres",
+        password="januar123", # Password sesuai file aslimu
+        port="5432"
+    )
+    kursor = koneksi.cursor()
+    
+    # Mengambil data mahasiswa beserta nama prodinya menggunakan JOIN
+    kursor.execute('''
+        SELECT m.nim, m.nama, p.nama_prodi, m.vektor_wajah 
+        FROM mahasiswa m
+        JOIN prodi p ON m.prodi_id = p.id_prodi
+    ''')
+    data_mahasiswa = kursor.fetchall()
+    koneksi.close()
+except Exception as e:
+    raise SystemExit(f"Gagal terhubung ke database: {e}")
+
+referensi = []
+for baris in data_mahasiswa:
+    nim = baris[0]
+    nama = baris[1]
+    nama_prodi = baris[2]
+    vektor_biner = baris[3]
+    
+    # Ubah data biner (BYTEA) kembali menjadi matriks 512 angka
+    embedding = np.frombuffer(vektor_biner, dtype=np.float32)
+    
+    referensi.append({
+        "nim": nim,
+        "nama": nama,
+        "prodi": nama_prodi,
+        "embedding": embedding
+    })
+
+if not referensi:
+    raise SystemExit("Database kosong! Belum ada wajah yang terdaftar.")
+
+print(f"Berhasil memuat {len(referensi)} data mahasiswa beserta prodinya dari PostgreSQL.")
+
+# 2. MUAT MESIN AI
+print("2. Memuat AI InsightFace...")
 app = FaceAnalysis(
     name="buffalo_l",
-    providers=["CPUExecutionProvider"]
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
 )
 app.prepare(ctx_id=-1, det_size=(320, 320))
 
-# Baca data mahasiswa
-with open("data_wajah/mahasiswa.json", "r", encoding="utf-8") as f:
-    mahasiswa = json.load(f)
-
-# Buat embedding referensi dari foto terdaftar
-referensi = []
-
-for nim, data in mahasiswa.items():
-    folder = os.path.join("data_wajah", data["folder_foto"])
-
-    for nama_file in os.listdir(folder):
-        if not nama_file.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-            continue
-
-        path = os.path.join(folder, nama_file)
-        gambar = cv2.imread(path)
-
-        if gambar is None:
-            continue
-
-        wajah = app.get(gambar)
-
-        if len(wajah) == 1:
-            referensi.append({
-                "nim": nim,
-                "nama": data["nama"],
-                "embedding": wajah[0].normed_embedding
-            })
-
-if not referensi:
-    raise SystemExit("Tidak ada foto referensi yang berhasil diproses.")
-
-print(f"Foto referensi berhasil dimuat: {len(referensi)}")
-print("Tekan Q pada jendela kamera untuk keluar.")
-
-# Buka kamera
+# 3. BUKA KAMERA & THREADING
 kamera = cv2.VideoCapture(0)
-
 if not kamera.isOpened():
-    raise SystemExit("Kamera tidak bisa dibuka. Coba indeks kamera 1.")
+    raise SystemExit("Kamera tidak bisa dibuka.")
 
-
-
-# Data bersama antara thread kamera, AI, dan tampilan
 lock = threading.Lock()
 berhenti = threading.Event()
-
 frame_terbaru = None
 nomor_frame = 0
 hasil_terakhir = []
 
-
 def ambil_kamera():
     global frame_terbaru, nomor_frame
-
     while not berhenti.is_set():
         berhasil, frame = kamera.read()
-
         if berhasil:
+            frame = cv2.flip(frame, 1) 
             with lock:
                 frame_terbaru = frame
                 nomor_frame += 1
         else:
             time.sleep(0.01)
 
-
 def proses_ai():
     global hasil_terakhir
-
     frame_diproses = -1
 
     while not berhenti.is_set():
@@ -100,87 +102,66 @@ def proses_ai():
             time.sleep(0.005)
             continue
 
-        # Batasi pengenalan sekitar 5 kali per detik
-        waktu_mulai = time.time()
         wajah_terdeteksi = app.get(frame)
         hasil_baru = []
 
-        for wajah in wajah_terdeteksi:
-            x1, y1, x2, y2 = map(int, wajah.bbox)
-            embedding = wajah.normed_embedding
+        # REVISI: Hanya proses 1 wajah terbesar jika ada wajah yang terdeteksi
+        if len(wajah_terdeteksi) > 0:
+            # Mencari wajah dengan area Bounding Box paling besar (Lebar * Tinggi)
+            wajah_utama = max(wajah_terdeteksi, key=lambda w: (w.bbox[2] - w.bbox[0]) * (w.bbox[3] - w.bbox[1]))
+            
+            x1, y1, x2, y2 = map(int, wajah_utama.bbox)
+            embedding_kamera = wajah_utama.normed_embedding
 
             skor_identitas = {}
-
             for ref in referensi:
-                skor = float(np.dot(embedding, ref["embedding"]))
+                skor = float(np.dot(embedding_kamera, ref["embedding"]))
                 nim = ref["nim"]
 
-                if (
-                    nim not in skor_identitas
-                    or skor > skor_identitas[nim]["skor"]
-                ):
+                if nim not in skor_identitas or skor > skor_identitas[nim]["skor"]:
                     skor_identitas[nim] = {
                         "nama": ref["nama"],
+                        "prodi": ref["prodi"],
                         "skor": skor
                     }
 
-            urutan = sorted(
-                skor_identitas.items(),
-                key=lambda item: item[1]["skor"],
-                reverse=True
-            )
+            urutan = sorted(skor_identitas.items(), key=lambda item: item[1]["skor"], reverse=True)
 
-            if not urutan:
-                continue
+            if urutan:
+                _, terbaik = urutan[0]
+                skor_tertinggi = terbaik["skor"]
+                selisih = skor_tertinggi - urutan[1][1]["skor"] if len(urutan) >= 2 else 0.0
 
-            _, terbaik = urutan[0]
-            skor_tertinggi = terbaik["skor"]
+                if skor_tertinggi < THRESHOLD_UJI:
+                    nama_tampil = "TIDAK DIKENALI"
+                    warna = (0, 0, 255)
+                elif selisih < MINIMAL_SELISIH:
+                    nama_tampil = "PERLU VERIFIKASI"
+                    warna = (0, 165, 255)
+                else:
+                    nama_tampil = f"{terbaik['nama']}"
+                    warna = (0, 255, 0)
 
-            selisih = (
-                skor_tertinggi - urutan[1][1]["skor"]
-                if len(urutan) >= 2 else 0.0
-            )
-
-            if skor_tertinggi < THRESHOLD_UJI:
-                nama_tampil = "TIDAK DIKENALI"
-                warna = (0, 0, 255)
-            elif selisih < MINIMAL_SELISIH:
-                nama_tampil = "PERLU VERIFIKASI"
-                warna = (0, 165, 255)
-            else:
-                nama_tampil = terbaik["nama"]
-                warna = (0, 255, 0)
-
-            hasil_baru.append({
-                "bbox": (x1, y1, x2, y2),
-                "nama": nama_tampil,
-                "skor": skor_tertinggi,
-                "warna": warna
-            })
+                hasil_baru.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "nama": nama_tampil,
+                    "skor": skor_tertinggi,
+                    "warna": warna
+                })
 
         with lock:
             hasil_terakhir = hasil_baru
 
-        # Jeda tambahan agar inferensi tidak terus membebani CPU
-        waktu_proses = time.time() - waktu_mulai
-        if waktu_proses < 0.20:
-            time.sleep(0.20 - waktu_proses)
-
-
-# Jalankan pengambilan kamera dan AI secara terpisah
-thread_kamera = threading.Thread(
-    target=ambil_kamera,
-    daemon=True
-)
-thread_ai = threading.Thread(
-    target=proses_ai,
-    daemon=True
-)
-
+thread_kamera = threading.Thread(target=ambil_kamera, daemon=True)
+thread_ai = threading.Thread(target=proses_ai, daemon=True)
 thread_kamera.start()
 thread_ai.start()
 
 print("Kamera aktif. Tekan Q pada jendela kamera untuk keluar.")
+prev_time = time.time()
+
+cv2.namedWindow("Uji Absensi dengan Relasi Prodi", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Uji Absensi dengan Relasi Prodi", 800, 600)
 
 try:
     while not berhenti.is_set():
@@ -189,45 +170,29 @@ try:
                 frame_tampil = None
             else:
                 frame_tampil = frame_terbaru.copy()
-
             hasil_tampil = list(hasil_terakhir)
 
         if frame_tampil is None:
             time.sleep(0.005)
             continue
 
+        curr_time = time.time()
+        fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
+        prev_time = curr_time
+
+        cv2.putText(frame_tampil, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
         for hasil in hasil_tampil:
             x1, y1, x2, y2 = hasil["bbox"]
             warna = hasil["warna"]
-
-            cv2.rectangle(
-                frame_tampil,
-                (x1, y1),
-                (x2, y2),
-                warna,
-                2
-            )
-
+            cv2.rectangle(frame_tampil, (x1, y1), (x2, y2), warna, 2)
             teks = f"{hasil['nama']} ({hasil['skor']:.2f})"
+            cv2.putText(frame_tampil, teks, (x1, max(25, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, warna, 2)
 
-            cv2.putText(
-                frame_tampil,
-                teks,
-                (x1, max(25, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                warna,
-                2
-            )
-
-        cv2.imshow(
-            "Uji Face Recognition - Tekan Q untuk keluar",
-            frame_tampil
-        )
+        cv2.imshow("Uji Absensi dengan Relasi Prodi", frame_tampil)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
-
 finally:
     berhenti.set()
     thread_kamera.join(timeout=2)
