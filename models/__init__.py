@@ -1,3 +1,2 @@
-from .yolov8 import YOLOv8Face
-
-__all__ = ["YOLOv8Face"]
+from .yolo11 import YOLO11Face
+__all__ = ["YOLO11Face"]

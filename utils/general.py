@@ -74,17 +74,19 @@ def draw_detections(image: np.ndarray, box: np.ndarray, score: float, landmarks:
     color = (0, 255, 0)
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
 
-    # Draw confidence score
-    label = f"{score:.2f}"
+    # Draw confidence score dan Nama
+    label = f"Januar Arif Wicaksono {score:.2f}"
     cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, lineType=cv2.LINE_AA)
 
     # Draw facial landmarks (5 points)
     landmarks = landmarks.reshape(5, 2).astype(int)
     for i, (lx, ly) in enumerate(landmarks):
-        if i < 2:
-            landmark_color = (0, 0, 255)  # Red for eyes
-        elif i == 2:
-            landmark_color = (255, 0, 0)  # Blue for nose
-        else:
-            landmark_color = (0, 255, 0)  # Green for mouth
-        cv2.circle(image, (lx, ly), 3, landmark_color, -1)
+        # Mencegah error gambar dengan mengecek apakah koordinat bukan hasil dummy (-1)
+        if lx > 0 and ly > 0:
+            if i < 2:
+                landmark_color = (0, 0, 255)  # Red for eyes
+            elif i == 2:
+                landmark_color = (255, 0, 0)  # Blue for nose
+            else:
+                landmark_color = (0, 255, 0)  # Green for mouth
+            cv2.circle(image, (lx, ly), 3, landmark_color, -1)

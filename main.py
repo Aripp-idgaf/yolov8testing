@@ -2,12 +2,12 @@
 # Author: Yakhyokhuja Valikhujaev
 # GitHub: https://github.com/yakhyo
 """
-YOLOv8-Face ONNX Inference Script
+YOLO11-Face ONNX Inference Script
 
 Usage:
-    python main.py --weights weights/yolov8n-face.onnx --source assets/test.jpg
-    python main.py --weights weights/yolov8n-face.onnx --source 0  # webcam
-    python main.py --weights weights/yolov8n-face.onnx --source video.mp4
+    python main.py --weights weights/yolov11n-face.onnx --source assets/test.jpg
+    python main.py --weights weights/yolov11n-face.onnx --source 0  # webcam
+    python main.py --weights weights/yolov11n-face.onnx --source video.mp4
 """
 
 import argparse
@@ -15,7 +15,7 @@ import os
 
 import cv2
 
-from models import YOLOv8Face
+from models import YOLO11Face
 from utils.general import draw_detections, letterbox, scale_boxes, scale_landmarks
 
 VID_FORMATS = ["mp4", "avi", "mov", "mkv"]
@@ -44,7 +44,7 @@ def run_face_detection(
         view_img: Whether to display results
     """
     # Initialize model
-    model = YOLOv8Face(weights, conf_thres, iou_thres, max_det=max_det)
+    model = YOLO11Face(weights, conf_thres, iou_thres, max_det=max_det)
 
     # Determine source type
     is_webcam = source.isdigit() or source == "0"
@@ -79,6 +79,10 @@ def run_face_detection(
     frame_idx = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if source_type == "video" else 0
 
+    # TAMBAHAN: Kode untuk membuat jendela bisa dimaksimalkan sebelum masuk perulangan (loop)
+    if view_img:
+        cv2.namedWindow("YOLO11-Face ONNX Inference", cv2.WINDOW_NORMAL)
+
     while True:
         if source_type == "image":
             frame = cv2.imread(source)
@@ -89,6 +93,9 @@ def run_face_detection(
             ret, frame = cap.read()
             if not ret:
                 break
+            # Tambahkan baris ini untuk membalikkan gambar kamera secara horizontal
+            if source_type == "webcam":
+                frame = cv2.flip(frame, 1)
 
         frame_idx += 1
 
@@ -119,7 +126,7 @@ def run_face_detection(
 
         # Display results
         if view_img:
-            cv2.imshow("YOLOv8-Face ONNX Inference", frame)
+            cv2.imshow("YOLO11-Face ONNX Inference", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
@@ -148,8 +155,8 @@ def run_face_detection(
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="YOLOv8-Face ONNX Inference")
-    parser.add_argument("--weights", type=str, default="weights/yolov8n-face.onnx", help="Path to ONNX model file")
+    parser = argparse.ArgumentParser(description="YOLO11-Face ONNX Inference")
+    parser.add_argument("--weights", type=str, default="weights/yolov11n-face.onnx", help="Path to ONNX model file")
     parser.add_argument("--source", type=str, default="0", help="Path to image/video file or webcam index")
     parser.add_argument("--conf-thres", type=float, default=0.5, help="Confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.45, help="NMS IoU threshold")
