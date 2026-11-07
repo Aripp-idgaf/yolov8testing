@@ -1,35 +1,54 @@
-import threading
-import time
 import cv2
-import mediapipe as mp
+import time
+import math
+import os
 import numpy as np
 import psycopg2
+import onnxruntime as ort
 from insightface.app import FaceAnalysis
 
-# Threshold
-# REVISI: Menaikkan threshold agar lebih ketat (menghindari False Positive)
-THRESHOLD_UJI = 0.65
-MINIMAL_SELISIH = 0.10
-EAR_THRESHOLD = 0.20
-MINIMUM_MATA_TERTUTUP_FRAMES = 2
+# ================= 1. KONFIGURASI SISTEM =================
+# Threshold dilonggarkan agar saat ganti ekspresi (senyum/mangap) tetap dikenali
+THRESHOLD_UJI = 0.55
+MINIMAL_SELISIH = 0.05
 
-# 1. TARIK DATA DARI DATABASE POSTGRESQL (DENGAN RELASI PRODI)
+# Konfigurasi Geofencing (Radius Absensi)
+KELAS_LAT = -6.9828        # Contoh latitude kelas
+KELAS_LON = 110.4091       # Contoh longitude kelas
+BATAS_RADIUS_METER = 50    # Maksimal jarak absen dari titik kelas (meter)
+
+# MOCKUP GPS: Ubah angka ini untuk mengetes sistem menolak atau menerima jarakmu
+GPS_MAHASISWA_SAAT_INI = (-6.9828, 110.4091)
+
+
+# ================= 2. FUNGSI PEMBANTU =================
+def hitung_jarak_meter(lat1, lon1, lat2, lon2):
+    """Menghitung jarak dua titik koordinat bumi dalam meter (Rumus Haversine)"""
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+def cek_wajah_asli_dasar(wajah_bgr):
+    """Metode cadangan deteksi layar HP/kertas jika model ONNX belum ada"""
+    abu_abu = cv2.cvtColor(wajah_bgr, cv2.COLOR_BGR2GRAY)
+    tekstur = cv2.Laplacian(abu_abu, cv2.CV_64F).var()
+    return 20 <= tekstur <= 1500
+
+
+# ================= 3. PERSIAPAN DATABASE & AI =================
 print("1. Menghubungkan ke PostgreSQL...")
 try:
     koneksi = psycopg2.connect(
-        host="localhost",
-        database="postgres",
-        user="postgres",
-        password="januar123", # Password sesuai file aslimu
-        port="5432"
+        host="10.137.197.64", database="postgres", user="postgres", password=os.environ["DB_PASSWORD"], port="5432"
     )
     kursor = koneksi.cursor()
-    
-    # Mengambil data mahasiswa beserta nama prodinya menggunakan JOIN
     kursor.execute('''
-        SELECT m.nim, m.nama, p.nama_prodi, m.vektor_wajah 
-        FROM mahasiswa m
-        JOIN prodi p ON m.prodi_id = p.id_prodi
+        SELECT m.nim, m.nama, p.nama_prodi, m.vektor_wajah
+        FROM mahasiswa m JOIN prodi p ON m.prodi_id = p.id_prodi
     ''')
     data_mahasiswa = kursor.fetchall()
     koneksi.close()
@@ -38,304 +57,142 @@ except Exception as e:
 
 referensi = []
 for baris in data_mahasiswa:
-    nim = baris[0]
-    nama = baris[1]
-    nama_prodi = baris[2]
-    vektor_biner = baris[3]
-    
-    # Ubah data biner (BYTEA) kembali menjadi matriks 512 angka
-    embedding = np.frombuffer(vektor_biner, dtype=np.float32)
-    
     referensi.append({
-        "nim": nim,
-        "nama": nama,
-        "prodi": nama_prodi,
-        "embedding": embedding
+        "nim": baris[0], "nama": baris[1], "prodi": baris[2],
+        "embedding": np.frombuffer(baris[3], dtype=np.float32)
     })
+print(f"Berhasil memuat {len(referensi)} data.")
 
-if not referensi:
-    raise SystemExit("Database kosong! Belum ada wajah yang terdaftar.")
+print("2. Memuat AI Pengenalan Wajah (InsightFace) di GPU...")
+app = FaceAnalysis(name="buffalo_l", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+app.prepare(ctx_id=0, det_size=(640, 640))
 
-print(f"Berhasil memuat {len(referensi)} data mahasiswa beserta prodinya dari PostgreSQL.")
-
-# 2. MUAT MESIN AI
-print("2. Memuat AI InsightFace...")
-app = FaceAnalysis(
-    name="buffalo_l",
-    providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-)
-app.prepare(ctx_id=-1, det_size=(320, 320))
-
-# 3. BUKA KAMERA & THREADING
-# 3. SIAPKAN LIVENESS DETECTION
-face_mesh = mp.solutions.face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=5,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-)
-
-MATA_KIRI = (362, 385, 387, 263, 373, 380)
-MATA_KANAN = (33, 160, 158, 133, 153, 144)
+print("3. Memuat AI Anti-Spoofing (Passive Liveness)...")
+FILE_MODEL_SPOOF = "antispoof.onnx"
+pakai_ai_spoof = False
+if os.path.exists(FILE_MODEL_SPOOF):
+    try:
+        # Muat file Anti-Spoofing ke dalam GPU
+        spoof_ai = ort.InferenceSession(FILE_MODEL_SPOOF, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        pakai_ai_spoof = True
+        print("[BERHASIL] AI Liveness (Anti-Spoofing) terdeteksi & aktif!")
+    except Exception as e:
+        print(f"[PERINGATAN] Gagal memuat antispoof.onnx: {e}")
+else:
+    print("[PERINGATAN] File 'antispoof.onnx' belum diunduh. Sistem memakai filter perlindungan dasar.")
 
 
-def hitung_ear(titik_wajah, indeks_mata, lebar, tinggi):
-    titik = np.array(
-        [
-            (titik_wajah.landmark[i].x * lebar, titik_wajah.landmark[i].y * tinggi)
-            for i in indeks_mata
-        ],
-        dtype=np.float32,
-    )
-    jarak_vertikal_1 = np.linalg.norm(titik[1] - titik[5])
-    jarak_vertikal_2 = np.linalg.norm(titik[2] - titik[4])
-    jarak_horizontal = np.linalg.norm(titik[0] - titik[3])
-    if jarak_horizontal == 0:
-        return 0.0
-    return float((jarak_vertikal_1 + jarak_vertikal_2) / (2.0 * jarak_horizontal))
+# ================= 4. PROSES UTAMA (LOOP KAMERA) =================
+# Hitung jarak sebelum kamera dibuka (karena ini masih GPS Statis/Mockup)
+jarak_mahasiswa = hitung_jarak_meter(GPS_MAHASISWA_SAAT_INI[0], GPS_MAHASISWA_SAAT_INI[1], KELAS_LAT, KELAS_LON)
 
-
-def hitung_iou(kotak_a, kotak_b):
-    x1 = max(kotak_a[0], kotak_b[0])
-    y1 = max(kotak_a[1], kotak_b[1])
-    x2 = min(kotak_a[2], kotak_b[2])
-    y2 = min(kotak_a[3], kotak_b[3])
-    luas_irisan = max(0, x2 - x1) * max(0, y2 - y1)
-    luas_a = max(0, kotak_a[2] - kotak_a[0]) * max(0, kotak_a[3] - kotak_a[1])
-    luas_b = max(0, kotak_b[2] - kotak_b[0]) * max(0, kotak_b[3] - kotak_b[1])
-    luas_gabungan = luas_a + luas_b - luas_irisan
-    return luas_irisan / luas_gabungan if luas_gabungan > 0 else 0.0
-
-
-def cari_landmark_wajah_utama(hasil_mesh, bbox_wajah, lebar, tinggi):
-    kandidat_terbaik = None
-    iou_terbaik = 0.0
-    for landmark_wajah in hasil_mesh.multi_face_landmarks or []:
-        x = [titik.x * lebar for titik in landmark_wajah.landmark]
-        y = [titik.y * tinggi for titik in landmark_wajah.landmark]
-        bbox_mesh = (min(x), min(y), max(x), max(y))
-        iou = hitung_iou(bbox_wajah, bbox_mesh)
-        if iou > iou_terbaik:
-            iou_terbaik = iou
-            kandidat_terbaik = landmark_wajah
-    return kandidat_terbaik if iou_terbaik > 0 else None
-
-
-# 4. BUKA KAMERA & THREADING
 kamera = cv2.VideoCapture(0)
 if not kamera.isOpened():
-    face_mesh.close()
     raise SystemExit("Kamera tidak bisa dibuka.")
 
-lock = threading.Lock()
-berhenti = threading.Event()
-frame_terbaru = None
-nomor_frame = 0
-hasil_terakhir = []
+cv2.namedWindow("Sistem Absensi Final", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Sistem Absensi Final", 800, 600)
+prev_time = time.time()
 
-def ambil_kamera():
-    global frame_terbaru, nomor_frame
-    while not berhenti.is_set():
-        berhasil, frame = kamera.read()
-        if berhasil:
-            frame = cv2.flip(frame, 1) 
-            with lock:
-                frame_terbaru = frame
-                nomor_frame += 1
-        else:
-            time.sleep(0.01)
+while True:
+    berhasil, frame = kamera.read()
+    if not berhasil: break
 
-def proses_ai():
-    global hasil_terakhir
-    frame_diproses = -1
-    liveness_aktif = False
-    mata_tertutup_frames = 0
-    bbox_wajah_terakhir = None
+    frame = cv2.flip(frame, 1)
 
-    while not berhenti.is_set():
-        with lock:
-            if frame_terbaru is None or nomor_frame == frame_diproses:
-                frame = None
-            else:
-                frame = frame_terbaru.copy()
-                frame_diproses = nomor_frame
-
-        if frame is None:
-            time.sleep(0.005)
-            continue
-
-        tinggi_frame, lebar_frame = frame.shape[:2]
+    # ----------------------------------------------------
+    # TAHAP 1: VALIDASI JARAK LOKASI
+    # ----------------------------------------------------
+    if jarak_mahasiswa > BATAS_RADIUS_METER:
+        cv2.putText(frame, f"DITOLAK! Jarak Anda: {jarak_mahasiswa:.1f} Meter dari Kelas", (20, frame.shape[0] // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, "(Masuk ke area kelas 50m untuk absen)", (20, (frame.shape[0] // 2) + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+    else:
+        # ----------------------------------------------------
+        # TAHAP 2: EKSEKUSI WAJAH GPU (LINEAR)
+        # ----------------------------------------------------
         wajah_terdeteksi = app.get(frame)
-        hasil_baru = []
 
-        # Hanya proses 1 wajah terbesar jika ada wajah yang terdeteksi.
         if len(wajah_terdeteksi) > 0:
             wajah_utama = max(wajah_terdeteksi, key=lambda w: (w.bbox[2] - w.bbox[0]) * (w.bbox[3] - w.bbox[1]))
             x1, y1, x2, y2 = map(int, wajah_utama.bbox)
-            bbox_wajah = (x1, y1, x2, y2)
 
-            if bbox_wajah_terakhir is not None and hitung_iou(
-                bbox_wajah_terakhir, bbox_wajah
-            ) < 0.10:
-                liveness_aktif = False
-                mata_tertutup_frames = 0
-            bbox_wajah_terakhir = bbox_wajah
+            # Potong bagian wajah dari gambar keseluruhan
+            wajah_crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+            is_asli = False
 
-            ear = None
-            if not liveness_aktif:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                hasil_mesh = face_mesh.process(frame_rgb)
-                titik_wajah = cari_landmark_wajah_utama(
-                    hasil_mesh, bbox_wajah, lebar_frame, tinggi_frame
-                )
+            # ----------------------------------------------------
+            # TAHAP 3: PASSIVE LIVENESS / ANTI-SPOOFING
+            # ----------------------------------------------------
+            if wajah_crop.size > 0:
+                if pakai_ai_spoof:
+                    try:
+                        # Siapkan format gambar untuk model MiniFASNet (80x80)
+                        blob = cv2.dnn.blobFromImage(wajah_crop, 1.0/255.0, (80, 80), (0, 0, 0), swapRB=True, crop=False)
+                        nama_input = spoof_ai.get_inputs()[0].name
+                        hasil_spoof = spoof_ai.run(None, {nama_input: blob})[0]
 
-                if titik_wajah is not None:
-                    ear_kiri = hitung_ear(
-                        titik_wajah, MATA_KIRI, lebar_frame, tinggi_frame
-                    )
-                    ear_kanan = hitung_ear(
-                        titik_wajah, MATA_KANAN, lebar_frame, tinggi_frame
-                    )
-                    ear = (ear_kiri + ear_kanan) / 2.0
+                        kelas_terdeteksi = np.argmax(hasil_spoof)
+                        skor_asli = hasil_spoof[0][1] # Asumsi index 1 adalah 'Wajah Nyata 3D'
 
-                    if ear < EAR_THRESHOLD:
-                        mata_tertutup_frames += 1
-                    else:
-                        if mata_tertutup_frames >= MINIMUM_MATA_TERTUTUP_FRAMES:
-                            liveness_aktif = True
-                        mata_tertutup_frames = 0
+                        is_asli = True if (kelas_terdeteksi == 1 and skor_asli > 0.80) else False
+                    except:
+                        is_asli = cek_wajah_asli_dasar(wajah_crop) # Mundur ke filter dasar jika struktur ONNX berbeda
                 else:
-                    mata_tertutup_frames = 0
+                    is_asli = cek_wajah_asli_dasar(wajah_crop)
 
-            if not liveness_aktif:
-                hasil_baru.append(
-                    {
-                        "bbox": bbox_wajah,
-                        "nama": "Silakan Berkedip untuk Absen!",
-                        "skor": None,
-                        "warna": (0, 165, 255),
-                        "liveness": False,
-                        "ear": ear,
-                    }
-                )
+            # ----------------------------------------------------
+            # TAHAP 4: PENCOCOKAN IDENTITAS (Hanya jika Lolos Spoof)
+            # ----------------------------------------------------
+            if not is_asli:
+                nama_tampil = "LAYAR HP / PALSU"
+                warna = (0, 0, 255)
+                skor_tampil = 0.0
             else:
-                # Tidak ada perbandingan embedding atau skor database sebelum blink.
                 embedding_kamera = wajah_utama.normed_embedding
                 skor_identitas = {}
+
                 for ref in referensi:
                     skor = float(np.dot(embedding_kamera, ref["embedding"]))
                     nim = ref["nim"]
-
                     if nim not in skor_identitas or skor > skor_identitas[nim]["skor"]:
-                        skor_identitas[nim] = {
-                            "nama": ref["nama"],
-                            "prodi": ref["prodi"],
-                            "skor": skor,
-                        }
+                        skor_identitas[nim] = {"nama": ref["nama"], "skor": skor}
 
-                urutan = sorted(
-                    skor_identitas.items(),
-                    key=lambda item: item[1]["skor"],
-                    reverse=True,
-                )
+                urutan = sorted(skor_identitas.items(), key=lambda item: item[1]["skor"], reverse=True)
 
                 if urutan:
                     _, terbaik = urutan[0]
                     skor_tertinggi = terbaik["skor"]
-                    selisih = (
-                        skor_tertinggi - urutan[1][1]["skor"]
-                        if len(urutan) >= 2
-                        else 0.0
-                    )
 
                     if skor_tertinggi < THRESHOLD_UJI:
                         nama_tampil = "TIDAK DIKENALI"
                         warna = (0, 0, 255)
-                    elif selisih < MINIMAL_SELISIH:
-                        nama_tampil = "PERLU VERIFIKASI"
-                        warna = (0, 165, 255)
                     else:
-                        nama_tampil = f"{terbaik['nama']} - Absen Berhasil!"
+                        nama_tampil = f"{terbaik['nama']}"
                         warna = (0, 255, 0)
+                    skor_tampil = skor_tertinggi
+                else:
+                    nama_tampil = "TIDAK DIKENALI"
+                    warna = (0, 0, 255)
+                    skor_tampil = 0.0
 
-                    hasil_baru.append(
-                        {
-                            "bbox": bbox_wajah,
-                            "nama": nama_tampil,
-                            "skor": skor_tertinggi,
-                            "warna": warna,
-                            "liveness": True,
-                            "ear": ear,
-                        }
-                    )
-        else:
-            liveness_aktif = False
-            mata_tertutup_frames = 0
-            bbox_wajah_terakhir = None
+            # Gambar Kotak Bounding Box Akhir
+            cv2.rectangle(frame, (x1, y1), (x2, y2), warna, 2)
+            teks = f"{nama_tampil} ({skor_tampil:.2f})" if nama_tampil not in ["TIDAK DIKENALI", "LAYAR HP / PALSU"] else nama_tampil
+            cv2.putText(frame, teks, (x1, max(25, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, warna, 2)
 
-        with lock:
-            hasil_terakhir = hasil_baru
+    # ----------------------------------------------------
+    # TAHAP 5: TAMPILAN DASHBOARD POJOK KIRI ATAS
+    # ----------------------------------------------------
+    curr_time = time.time()
+    fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
+    prev_time = curr_time
 
-thread_kamera = threading.Thread(target=ambil_kamera, daemon=True)
-thread_ai = threading.Thread(target=proses_ai, daemon=True)
-thread_kamera.start()
-thread_ai.start()
+    teks_info = f"FPS: {fps:.1f} | Jarak: {jarak_mahasiswa:.1f}m | Anti-Spoof: {'AI (ONNX)' if pakai_ai_spoof else 'Dasar (Laplacian)'}"
+    cv2.putText(frame, teks_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-print("Kamera aktif. Tekan Q pada jendela kamera untuk keluar.")
-prev_time = time.time()
+    cv2.imshow("Sistem Absensi Final", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-cv2.namedWindow("Uji Absensi dengan Relasi Prodi", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Uji Absensi dengan Relasi Prodi", 800, 600)
-
-try:
-    while not berhenti.is_set():
-        with lock:
-            if frame_terbaru is None:
-                frame_tampil = None
-            else:
-                frame_tampil = frame_terbaru.copy()
-            hasil_tampil = list(hasil_terakhir)
-
-        if frame_tampil is None:
-            time.sleep(0.005)
-            continue
-
-        curr_time = time.time()
-        fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
-        prev_time = curr_time
-
-        cv2.putText(frame_tampil, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-        for hasil in hasil_tampil:
-            x1, y1, x2, y2 = hasil["bbox"]
-            warna = hasil["warna"]
-            cv2.rectangle(frame_tampil, (x1, y1), (x2, y2), warna, 2)
-            if hasil["skor"] is None:
-                teks = hasil["nama"]
-            else:
-                teks = f"{hasil['nama']} ({hasil['skor']:.2f})"
-            cv2.putText(frame_tampil, teks, (x1, max(25, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, warna, 2)
-            status_liveness = f"Liveness = {hasil['liveness']}"
-            cv2.putText(
-                frame_tampil,
-                status_liveness,
-                (x1, min(frame_tampil.shape[0] - 10, y2 + 25)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                warna,
-                2,
-            )
-
-        cv2.imshow("Uji Absensi dengan Relasi Prodi", frame_tampil)
-
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-finally:
-    berhenti.set()
-    thread_kamera.join(timeout=2)
-    thread_ai.join(timeout=2)
-    kamera.release()
-    face_mesh.close()
-    cv2.destroyAllWindows()
+kamera.release()
+cv2.destroyAllWindows()
